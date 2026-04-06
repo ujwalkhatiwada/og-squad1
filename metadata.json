@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Healthkart",
+  "description": "A modern platform for scanning medical bills, categorizing expenses, and discovering cost-saving options with smart payment plans.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
