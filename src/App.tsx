@@ -29,7 +29,6 @@ import { useDropzone } from 'react-dropzone';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { supabase } from './lib/supabase';
-import Tesseract from 'tesseract.js';
 import { GoogleGenAI, Type } from '@google/genai';
 
 // Utility for tailwind classes
@@ -38,25 +37,49 @@ function cn(...inputs: ClassValue[]) {
 }
 
 // --- AI Service ---
-const parseWithAI = async (text: string) => {
+const analyzeBillWithAI = async (file: File) => {
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
   
+  // Convert file to base64
+  const base64Data = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = (reader.result as string).split(',')[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `You are a professional medical billing auditor. Analyze the following OCR text from a medical bill: "${text}".
-    
-    Extract the following details with high precision:
-    1. Hospital/Provider Name
-    2. Total Amount (as a number)
-    3. Billing Date (YYYY-MM-DD)
-    4. Patient Name (if visible)
-    5. Detailed line items:
-       - Name of service/item
-       - Amount
-       - Status (Standard, Overpriced, Potential Error, Generic Available)
-       - Practical suggestion for savings or correction.
-    
-    Return the data in a structured JSON format.`,
+    contents: [
+      {
+        parts: [
+          {
+            inlineData: {
+              mimeType: file.type,
+              data: base64Data,
+            },
+          },
+          {
+            text: `You are a professional medical billing auditor. Analyze this medical bill.
+            Extract the following details with high precision:
+            1. Hospital/Provider Name
+            2. Total Amount (as a number)
+            3. Billing Date (YYYY-MM-DD)
+            4. Patient Name (if visible)
+            5. Detailed line items:
+               - Name of service/item
+               - Amount
+               - Status (Standard, Overpriced, Potential Error, Generic Available)
+               - Practical suggestion for savings or correction.
+            
+            Return the data in a structured JSON format.`,
+          },
+        ],
+      },
+    ],
     config: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -91,9 +114,10 @@ const parseWithAI = async (text: string) => {
 
 const uploadImage = async (file: File) => {
   try {
+    const fileName = `bill-${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
     const { data, error } = await supabase.storage
       .from("bills")
-      .upload(`bill-${Date.now()}.jpg`, file);
+      .upload(fileName, file);
     if (error) throw error;
     return data.path;
   } catch (err) {
@@ -402,12 +426,16 @@ const Features = () => {
 };
 
 const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [status, setStatus] = useState<'idle' | 'uploading' | 'analyzing' | 'saving' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [isCameraMode, setIsCameraMode] = useState(false);
+  const [autoCaptureEnabled, setAutoCaptureEnabled] = useState(true);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const countdownTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const startCamera = async () => {
     try {
@@ -417,20 +445,57 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         setIsCameraMode(true);
+        
+        if (autoCaptureEnabled) {
+          startCountdown();
+        }
       }
     } catch (err) {
       console.error("Camera access denied:", err);
       setError("Camera access denied. Please check permissions.");
+      setStatus('error');
     }
   };
 
+  const startCountdown = () => {
+    setCountdown(3);
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    
+    countdownTimerRef.current = setInterval(() => {
+      setCountdown(prev => {
+        if (prev === 1) {
+          clearInterval(countdownTimerRef.current!);
+          captureFrame();
+          return null;
+        }
+        return prev ? prev - 1 : null;
+      });
+    }, 1000);
+  };
+
   const stopCamera = () => {
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setCountdown(null);
+    
     if (videoRef.current && videoRef.current.srcObject) {
       const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
       tracks.forEach(track => track.stop());
       videoRef.current.srcObject = null;
     }
     setIsCameraMode(false);
+  };
+
+  const cancelScan = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    setStatus('idle');
+    setError(null);
+    setPreview(null);
+    if (isCameraMode) stopCamera();
   };
 
   const captureFrame = async () => {
@@ -455,27 +520,46 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
   };
 
   const processFile = async (file: File) => {
+    // Basic validation
+    if (file.size > 10 * 1024 * 1024) {
+      setError("File is too large. Maximum size is 10MB.");
+      setStatus('error');
+      return;
+    }
+
     const objectUrl = URL.createObjectURL(file);
     setPreview(objectUrl);
-    setIsAnalyzing(true);
+    setStatus('analyzing');
     setError(null);
+    setCountdown(null);
+
+    // Create new abort controller for this request
+    abortControllerRef.current = new AbortController();
 
     try {
-      const { data: { text } } = await Tesseract.recognize(file, 'eng');
-      if (!text || text.trim().length < 10) {
-        throw new Error("Could not extract enough text. Please ensure the bill is clear.");
+      // Step 1: AI Analysis (Multimodal)
+      const parsedData = await analyzeBillWithAI(file);
+      
+      // Check if cancelled
+      if (status === 'idle') return;
+
+      if (!parsedData || !parsedData.hospital_name) {
+        throw new Error("Could not extract data from this file. Please ensure the bill is clear and readable.");
       }
-      const parsedData = await parseWithAI(text);
+
+      // Step 2: Background Upload & Save
+      setStatus('saving');
       const imagePath = await uploadImage(file);
       await saveToSupabase(parsedData, imagePath);
+
       onAnalyzed(parsedData);
       if (isCameraMode) stopCamera();
+      setStatus('idle');
     } catch (err: any) {
+      if (err.name === 'AbortError') return;
       console.error('Analysis failed:', err);
-      setError(err.message || "An error occurred during analysis.");
-      setPreview(null);
-    } finally {
-      setIsAnalyzing(false);
+      setError(err.message || "An error occurred during analysis. Please try again with a clearer image.");
+      setStatus('error');
     }
   };
 
@@ -485,7 +569,10 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
   }, [onAnalyzed]);
 
   useEffect(() => {
-    return () => stopCamera();
+    return () => {
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+      stopCamera();
+    };
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
@@ -494,19 +581,33 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
       'image/*': ['.jpeg', '.jpg', '.png'],
       'application/pdf': ['.pdf']
     },
-    multiple: false
+    multiple: false,
+    disabled: status !== 'idle' && status !== 'error'
   } as any);
+
+  const getStatusMessage = () => {
+    switch (status) {
+      case 'uploading': return 'Uploading file...';
+      case 'analyzing': return 'AI is auditing your bill...';
+      case 'saving': return 'Securing your data...';
+      default: return 'Analyzing Data';
+    }
+  };
 
   return (
     <section id="scan" className="py-24">
       <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="bg-white rounded-[2.5rem] p-8 md:p-12 shadow-2xl shadow-slate-200 border border-slate-100">
           <div className="text-center mb-10">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-50 text-brand-600 text-[10px] font-black uppercase tracking-widest mb-4 border border-brand-100">
+              <Zap className="w-3 h-3 fill-current" />
+              Auto-Scan Active
+            </div>
             <h2 className="text-3xl font-display font-bold text-slate-900 mb-3">
-              {isCameraMode ? "Live Scanner" : "Upload your bill"}
+              {isCameraMode ? "Live Smart Scanner" : "Upload your bill"}
             </h2>
             <p className="text-slate-600">
-              {isCameraMode ? "Align the bill within the frame" : "Snap a photo or upload a PDF. We'll handle the rest."}
+              {isCameraMode ? "Hold steady. Auto-capture will trigger in 3s." : "Snap a photo or upload a PDF. Scanning starts instantly."}
             </p>
           </div>
 
@@ -515,19 +616,23 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
             className={cn(
               "relative aspect-video rounded-3xl border-2 border-dashed transition-all cursor-pointer flex flex-col items-center justify-center overflow-hidden bg-slate-50",
               isDragActive ? "border-brand-500 bg-brand-50/50" : "border-slate-200 hover:border-brand-400 hover:bg-slate-50",
-              isAnalyzing && "border-brand-500 shadow-2xl shadow-brand-500/20",
+              (status === 'analyzing' || status === 'saving') && "border-brand-500 shadow-2xl shadow-brand-500/20",
               isCameraMode && "border-brand-500 border-solid"
             )}
             onClick={(e) => {
-              if (isCameraMode) {
+              if (isCameraMode && status === 'idle') {
                 e.stopPropagation();
+                if (countdown !== null) {
+                  clearInterval(countdownTimerRef.current!);
+                  setCountdown(null);
+                }
                 captureFrame();
               }
             }}
           >
-            <input {...getInputProps()} />
+            <input {...getInputProps({ capture: 'environment' } as any)} />
             
-            {isCameraMode && !isAnalyzing && (
+            {isCameraMode && status === 'idle' && (
               <video 
                 ref={videoRef}
                 autoPlay
@@ -539,7 +644,27 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
             <canvas ref={canvasRef} className="hidden" />
             
             <AnimatePresence mode="wait">
-              {isAnalyzing ? (
+              {countdown !== null && (
+                <motion.div 
+                  initial={{ scale: 0.5, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 1.5, opacity: 0 }}
+                  className="absolute inset-0 z-20 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm"
+                >
+                  <div className="text-center">
+                    <p className="text-white text-sm font-black uppercase tracking-[0.3em] mb-4">Capturing in</p>
+                    <span className="text-8xl font-display font-black text-white drop-shadow-2xl">{countdown}</span>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setCountdown(null); if (countdownTimerRef.current) clearInterval(countdownTimerRef.current); }}
+                      className="mt-8 block mx-auto px-6 py-2 bg-white/20 hover:bg-white/30 text-white rounded-full text-xs font-bold transition-colors"
+                    >
+                      Cancel Auto-Capture
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+
+              {(status === 'analyzing' || status === 'saving') ? (
                 <motion.div 
                   key="analyzing"
                   initial={{ opacity: 0 }}
@@ -563,11 +688,19 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
 
                   <div className="relative z-30 text-center px-6">
                     <div className="w-16 h-16 border-4 border-white/20 border-t-brand-400 rounded-full animate-spin mx-auto mb-6 shadow-lg" />
-                    <p className="text-2xl font-display font-black text-white mb-2 tracking-tight">ANALYZING DATA</p>
-                    <div className="flex items-center justify-center gap-2">
+                    <p className="text-2xl font-display font-black text-white mb-2 tracking-tight uppercase">{getStatusMessage()}</p>
+                    <div className="flex items-center justify-center gap-2 mb-8">
                       <span className="h-2 w-2 bg-brand-400 rounded-full animate-pulse" />
-                      <p className="text-sm font-bold text-brand-100 uppercase tracking-[0.3em]">Auditing line items...</p>
+                      <p className="text-sm font-bold text-brand-100 uppercase tracking-[0.3em]">
+                        {status === 'analyzing' ? 'Auditing line items...' : 'Encrypting records...'}
+                      </p>
                     </div>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); cancelScan(); }}
+                      className="px-8 py-3 bg-white/10 hover:bg-white/20 text-white rounded-2xl font-bold transition-all border border-white/10"
+                    >
+                      Cancel Scan
+                    </button>
                   </div>
                 </motion.div>
               ) : isCameraMode ? (
@@ -580,10 +713,12 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
                   
                   <div className="bg-slate-900/80 backdrop-blur-md text-white px-6 py-3 rounded-full flex items-center gap-3 shadow-2xl border border-white/10">
                     <Camera className="w-5 h-5 text-brand-400" />
-                    <span className="font-bold text-sm uppercase tracking-widest">Tap to Capture & Scan</span>
+                    <span className="font-bold text-sm uppercase tracking-widest">
+                      {countdown !== null ? 'Auto-Capturing...' : 'Tap to Capture & Scan'}
+                    </span>
                   </div>
                 </div>
-              ) : error ? (
+              ) : status === 'error' ? (
                 <motion.div 
                   key="error"
                   initial={{ opacity: 0 }}
@@ -596,12 +731,29 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
                   </div>
                   <p className="text-xl font-bold text-red-600 mb-2">Analysis Failed</p>
                   <p className="text-slate-500 mb-6 max-w-xs mx-auto">{error}</p>
-                  <button 
-                    onClick={(e) => { e.stopPropagation(); setError(null); }}
-                    className="bg-red-600 text-white px-8 py-3 rounded-xl font-bold hover:bg-red-700 transition-all"
-                  >
-                    Try again
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-3 justify-center">
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); setStatus('idle'); setError(null); }}
+                      className="bg-red-600 text-white px-8 py-3 rounded-xl font-bold hover:bg-red-700 transition-all"
+                    >
+                      Try again
+                    </button>
+                    <button 
+                      onClick={(e) => { 
+                        e.stopPropagation(); 
+                        onAnalyzed({
+                          hospital_name: "Manual Entry",
+                          total: 0,
+                          date: new Date().toISOString().split('T')[0],
+                          savings: 0,
+                          categories: []
+                        });
+                      }}
+                      className="bg-slate-100 text-slate-600 px-8 py-3 rounded-xl font-bold hover:bg-slate-200 transition-all"
+                    >
+                      Enter Manually
+                    </button>
+                  </div>
                 </motion.div>
               ) : (
                 <motion.div 
@@ -635,30 +787,51 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
               </div>
             </div>
             
-            <button 
-              onClick={(e) => {
-                e.stopPropagation();
-                isCameraMode ? stopCamera() : startCamera();
-              }}
-              className={cn(
-                "flex items-center gap-3 px-6 py-3 rounded-xl font-bold transition-all",
-                isCameraMode 
-                  ? "bg-slate-100 text-slate-600 hover:bg-slate-200" 
-                  : "bg-brand-50 text-brand-700 hover:bg-brand-100"
+            <div className="flex items-center gap-3">
+              {isCameraMode && (
+                <button 
+                  onClick={() => {
+                    setAutoCaptureEnabled(!autoCaptureEnabled);
+                    if (!autoCaptureEnabled) startCountdown();
+                    else if (countdownTimerRef.current) {
+                      clearInterval(countdownTimerRef.current);
+                      setCountdown(null);
+                    }
+                  }}
+                  className={cn(
+                    "px-4 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all",
+                    autoCaptureEnabled ? "bg-brand-600 text-white" : "bg-slate-100 text-slate-500"
+                  )}
+                >
+                  Auto: {autoCaptureEnabled ? 'ON' : 'OFF'}
+                </button>
               )}
-            >
-              {isCameraMode ? (
-                <>
-                  <RefreshCw className="w-5 h-5" />
-                  Switch to Upload
-                </>
-              ) : (
-                <>
-                  <Camera className="w-5 h-5" />
-                  Use Live Camera
-                </>
-              )}
-            </button>
+              <button 
+                disabled={status !== 'idle' && status !== 'error'}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  isCameraMode ? stopCamera() : startCamera();
+                }}
+                className={cn(
+                  "flex items-center gap-3 px-6 py-3 rounded-xl font-bold transition-all disabled:opacity-50",
+                  isCameraMode 
+                    ? "bg-slate-100 text-slate-600 hover:bg-slate-200" 
+                    : "bg-brand-50 text-brand-700 hover:bg-brand-100"
+                )}
+              >
+                {isCameraMode ? (
+                  <>
+                    <RefreshCw className="w-5 h-5" />
+                    Switch to Upload
+                  </>
+                ) : (
+                  <>
+                    <Camera className="w-5 h-5" />
+                    Use Live Camera
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </div>
