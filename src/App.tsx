@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { 
   Search, 
   Upload, 
@@ -20,18 +20,108 @@ import {
   Scan,
   PieChart,
   Zap,
-  Loader2
+  Loader2,
+  Camera,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useDropzone } from 'react-dropzone';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { supabase } from './lib/supabase';
+import Tesseract from 'tesseract.js';
+import { GoogleGenAI, Type } from '@google/genai';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+// --- AI Service ---
+const parseWithAI = async (text: string) => {
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+  
+  const response = await ai.models.generateContent({
+    model: "gemini-3-flash-preview",
+    contents: `You are a professional medical billing auditor. Analyze the following OCR text from a medical bill: "${text}".
+    
+    Extract the following details with high precision:
+    1. Hospital/Provider Name
+    2. Total Amount (as a number)
+    3. Billing Date (YYYY-MM-DD)
+    4. Patient Name (if visible)
+    5. Detailed line items:
+       - Name of service/item
+       - Amount
+       - Status (Standard, Overpriced, Potential Error, Generic Available)
+       - Practical suggestion for savings or correction.
+    
+    Return the data in a structured JSON format.`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          hospital_name: { type: Type.STRING },
+          total: { type: Type.NUMBER },
+          date: { type: Type.STRING },
+          patient_name: { type: Type.STRING },
+          savings: { type: Type.NUMBER, description: "Total estimated savings across all items" },
+          categories: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                amount: { type: Type.NUMBER },
+                status: { type: Type.STRING },
+                suggestion: { type: Type.STRING }
+              },
+              required: ["name", "amount", "status"]
+            }
+          }
+        },
+        required: ["hospital_name", "total", "date", "savings", "categories"]
+      }
+    }
+  });
+
+  return JSON.parse(response.text || '{}');
+};
+
+const uploadImage = async (file: File) => {
+  try {
+    const { data, error } = await supabase.storage
+      .from("bills")
+      .upload(`bill-${Date.now()}.jpg`, file);
+    if (error) throw error;
+    return data.path;
+  } catch (err) {
+    console.error('Error uploading image:', err);
+    return null;
+  }
+};
+
+const saveToSupabase = async (data: any, imagePath: string | null) => {
+  try {
+    const { error } = await supabase
+      .from('medical_expenses')
+      .insert([
+        {
+          hospital: data.hospital_name,
+          amount: data.total,
+          date: data.date,
+          savings: data.savings,
+          details: data.categories,
+          image_path: imagePath,
+          created_at: new Date().toISOString()
+        }
+      ]);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Error saving to Supabase:', err);
+  }
+};
 
 // --- Components ---
 
@@ -313,24 +403,90 @@ const Features = () => {
 
 const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [isCameraMode, setIsCameraMode] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    setIsAnalyzing(true);
-    // Simulate AI Analysis
-    setTimeout(() => {
-      setIsAnalyzing(false);
-      onAnalyzed({
-        total: 12450,
-        savings: 3120,
-        categories: [
-          { name: 'Consultation', amount: 2500, status: 'Standard' },
-          { name: 'Lab Tests', amount: 4500, status: 'Overpriced', suggestion: 'Save $1200 at LabCorp' },
-          { name: 'Pharmacy', amount: 3450, status: 'Generic Available', suggestion: 'Save $1920 with Generic' },
-          { name: 'Miscellaneous', amount: 2000, status: 'Review Needed' },
-        ]
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } 
       });
-    }, 3000);
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        setIsCameraMode(true);
+      }
+    } catch (err) {
+      console.error("Camera access denied:", err);
+      setError("Camera access denied. Please check permissions.");
+    }
+  };
+
+  const stopCamera = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+      tracks.forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    setIsCameraMode(false);
+  };
+
+  const captureFrame = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    canvas.toBlob(async (blob) => {
+      if (blob) {
+        const file = new File([blob], "capture.jpg", { type: "image/jpeg" });
+        await processFile(file);
+      }
+    }, 'image/jpeg', 0.95);
+  };
+
+  const processFile = async (file: File) => {
+    const objectUrl = URL.createObjectURL(file);
+    setPreview(objectUrl);
+    setIsAnalyzing(true);
+    setError(null);
+
+    try {
+      const { data: { text } } = await Tesseract.recognize(file, 'eng');
+      if (!text || text.trim().length < 10) {
+        throw new Error("Could not extract enough text. Please ensure the bill is clear.");
+      }
+      const parsedData = await parseWithAI(text);
+      const imagePath = await uploadImage(file);
+      await saveToSupabase(parsedData, imagePath);
+      onAnalyzed(parsedData);
+      if (isCameraMode) stopCamera();
+    } catch (err: any) {
+      console.error('Analysis failed:', err);
+      setError(err.message || "An error occurred during analysis.");
+      setPreview(null);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    if (acceptedFiles.length === 0) return;
+    await processFile(acceptedFiles[0]);
   }, [onAnalyzed]);
+
+  useEffect(() => {
+    return () => stopCamera();
+  }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ 
     onDrop,
@@ -346,19 +502,41 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
       <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="bg-white rounded-[2.5rem] p-8 md:p-12 shadow-2xl shadow-slate-200 border border-slate-100">
           <div className="text-center mb-10">
-            <h2 className="text-3xl font-display font-bold text-slate-900 mb-3">Upload your bill</h2>
-            <p className="text-slate-600">Snap a photo or upload a PDF. We'll handle the rest.</p>
+            <h2 className="text-3xl font-display font-bold text-slate-900 mb-3">
+              {isCameraMode ? "Live Scanner" : "Upload your bill"}
+            </h2>
+            <p className="text-slate-600">
+              {isCameraMode ? "Align the bill within the frame" : "Snap a photo or upload a PDF. We'll handle the rest."}
+            </p>
           </div>
 
           <div 
             {...getRootProps()} 
             className={cn(
-              "relative aspect-video rounded-3xl border-2 border-dashed transition-all cursor-pointer flex flex-col items-center justify-center p-8 overflow-hidden",
+              "relative aspect-video rounded-3xl border-2 border-dashed transition-all cursor-pointer flex flex-col items-center justify-center overflow-hidden bg-slate-50",
               isDragActive ? "border-brand-500 bg-brand-50/50" : "border-slate-200 hover:border-brand-400 hover:bg-slate-50",
-              isAnalyzing && "pointer-events-none opacity-50"
+              isAnalyzing && "border-brand-500 shadow-2xl shadow-brand-500/20",
+              isCameraMode && "border-brand-500 border-solid"
             )}
+            onClick={(e) => {
+              if (isCameraMode) {
+                e.stopPropagation();
+                captureFrame();
+              }
+            }}
           >
             <input {...getInputProps()} />
+            
+            {isCameraMode && !isAnalyzing && (
+              <video 
+                ref={videoRef}
+                autoPlay
+                playsInline
+                className="absolute inset-0 w-full h-full object-cover"
+              />
+            )}
+
+            <canvas ref={canvasRef} className="hidden" />
             
             <AnimatePresence mode="wait">
               {isAnalyzing ? (
@@ -367,14 +545,63 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
-                  className="text-center relative z-10"
+                  className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-slate-900/60 backdrop-blur-[4px]"
                 >
-                  <div className="absolute inset-0 -z-10 flex items-center justify-center">
-                    <div className="w-full h-1 bg-brand-500/50 blur-sm animate-scan" />
+                  {preview && (
+                    <img 
+                      src={preview} 
+                      alt="Preview" 
+                      className="absolute inset-0 w-full h-full object-cover opacity-40"
+                    />
+                  )}
+                  
+                  <motion.div 
+                    animate={{ top: ['0%', '100%', '0%'] }}
+                    transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
+                    className="absolute left-0 right-0 h-1 bg-linear-to-r from-transparent via-brand-400 to-transparent shadow-[0_0_20px_rgba(20,184,166,1)] z-20"
+                  />
+
+                  <div className="relative z-30 text-center px-6">
+                    <div className="w-16 h-16 border-4 border-white/20 border-t-brand-400 rounded-full animate-spin mx-auto mb-6 shadow-lg" />
+                    <p className="text-2xl font-display font-black text-white mb-2 tracking-tight">ANALYZING DATA</p>
+                    <div className="flex items-center justify-center gap-2">
+                      <span className="h-2 w-2 bg-brand-400 rounded-full animate-pulse" />
+                      <p className="text-sm font-bold text-brand-100 uppercase tracking-[0.3em]">Auditing line items...</p>
+                    </div>
                   </div>
-                  <div className="w-16 h-16 border-4 border-brand-200 border-t-brand-600 rounded-full animate-spin mx-auto mb-6" />
-                  <p className="text-lg font-bold text-slate-900 mb-2">AI is analyzing your bill...</p>
-                  <p className="text-sm text-slate-500">Extracting line items and checking for errors</p>
+                </motion.div>
+              ) : isCameraMode ? (
+                <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center">
+                  {/* Viewfinder Corners */}
+                  <div className="absolute top-8 left-8 w-12 h-12 border-t-4 border-l-4 border-brand-500 rounded-tl-2xl" />
+                  <div className="absolute top-8 right-8 w-12 h-12 border-t-4 border-r-4 border-brand-500 rounded-tr-2xl" />
+                  <div className="absolute bottom-8 left-8 w-12 h-12 border-b-4 border-l-4 border-brand-500 rounded-bl-2xl" />
+                  <div className="absolute bottom-8 right-8 w-12 h-12 border-b-4 border-r-4 border-brand-500 rounded-br-2xl" />
+                  
+                  <div className="bg-slate-900/80 backdrop-blur-md text-white px-6 py-3 rounded-full flex items-center gap-3 shadow-2xl border border-white/10">
+                    <Camera className="w-5 h-5 text-brand-400" />
+                    <span className="font-bold text-sm uppercase tracking-widest">Tap to Capture & Scan</span>
+                  </div>
+                </div>
+              ) : error ? (
+                <motion.div 
+                  key="error"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="text-center p-6"
+                >
+                  <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                    <AlertCircle className="w-10 h-10 text-red-600" />
+                  </div>
+                  <p className="text-xl font-bold text-red-600 mb-2">Analysis Failed</p>
+                  <p className="text-slate-500 mb-6 max-w-xs mx-auto">{error}</p>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); setError(null); }}
+                    className="bg-red-600 text-white px-8 py-3 rounded-xl font-bold hover:bg-red-700 transition-all"
+                  >
+                    Try again
+                  </button>
                 </motion.div>
               ) : (
                 <motion.div 
@@ -384,7 +611,7 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
                   exit={{ opacity: 0 }}
                   className="text-center"
                 >
-                  <div className="w-20 h-20 bg-brand-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                  <div className="w-20 h-20 bg-brand-50 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:scale-110 transition-transform">
                     <Upload className="w-10 h-10 text-brand-600" />
                   </div>
                   <p className="text-xl font-bold text-slate-900 mb-2">
@@ -396,19 +623,42 @@ const BillScanner = ({ onAnalyzed }: { onAnalyzed: (data: any) => void }) => {
             </AnimatePresence>
           </div>
 
-          <div className="mt-10 grid grid-cols-1 sm:grid-cols-3 gap-6">
-            <div className="flex items-center gap-3 text-sm text-slate-600">
-              <ShieldCheck className="w-5 h-5 text-green-500" />
-              HIPAA Compliant
+          <div className="mt-8 flex flex-col sm:flex-row items-center justify-between gap-6">
+            <div className="flex items-center gap-6">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-500 uppercase tracking-widest">
+                <ShieldCheck className="w-4 h-4 text-green-500" />
+                HIPAA Secure
+              </div>
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-500 uppercase tracking-widest">
+                <ShieldCheck className="w-4 h-4 text-green-500" />
+                Encrypted
+              </div>
             </div>
-            <div className="flex items-center gap-3 text-sm text-slate-600">
-              <ShieldCheck className="w-5 h-5 text-green-500" />
-              Bank-grade Security
-            </div>
-            <div className="flex items-center gap-3 text-sm text-slate-600">
-              <ShieldCheck className="w-5 h-5 text-green-500" />
-              100% Private
-            </div>
+            
+            <button 
+              onClick={(e) => {
+                e.stopPropagation();
+                isCameraMode ? stopCamera() : startCamera();
+              }}
+              className={cn(
+                "flex items-center gap-3 px-6 py-3 rounded-xl font-bold transition-all",
+                isCameraMode 
+                  ? "bg-slate-100 text-slate-600 hover:bg-slate-200" 
+                  : "bg-brand-50 text-brand-700 hover:bg-brand-100"
+              )}
+            >
+              {isCameraMode ? (
+                <>
+                  <RefreshCw className="w-5 h-5" />
+                  Switch to Upload
+                </>
+              ) : (
+                <>
+                  <Camera className="w-5 h-5" />
+                  Use Live Camera
+                </>
+              )}
+            </button>
           </div>
         </div>
       </div>
@@ -570,7 +820,7 @@ const AnalysisResult = ({ data, onSelectPlan }: { data: any, onSelectPlan: (plan
             </div>
             <h2 className="text-4xl md:text-5xl font-display font-bold mb-6">Your Personalized Savings Plan</h2>
             <p className="text-slate-400 text-lg mb-10 leading-relaxed">
-              We've analyzed your bill from City General Hospital. Good news! We found potential savings of <span className="text-brand-400 font-bold">${data.savings}</span>.
+              We've analyzed your bill from <span className="text-white font-bold">{data.hospital_name}</span>. Good news! We found potential savings of <span className="text-brand-400 font-bold">${data.savings}</span>.
             </p>
 
             <motion.div 
@@ -634,10 +884,10 @@ const AnalysisResult = ({ data, onSelectPlan }: { data: any, onSelectPlan: (plan
                     <span className="font-bold">0% Interest EMI</span>
                     <span className="px-2 py-1 rounded bg-green-500/20 text-green-400 text-[10px] font-bold uppercase">Popular</span>
                   </div>
-                  <p className="text-3xl font-display font-bold mb-2">$777.50 <span className="text-lg font-normal text-white/60">/mo</span></p>
+                  <p className="text-3xl font-display font-bold mb-2">${(data.total / 12).toFixed(2)} <span className="text-lg font-normal text-white/60">/mo</span></p>
                   <p className="text-sm text-white/70 mb-6">Pay over 12 months with no extra cost.</p>
                   <button 
-                    onClick={() => onSelectPlan({ name: '0% Interest EMI', amount: 777.50 })}
+                    onClick={() => onSelectPlan({ name: '0% Interest EMI', amount: (data.total / 12).toFixed(2) })}
                     className="w-full py-4 rounded-xl bg-white text-brand-700 font-bold hover:bg-slate-100 transition-colors"
                   >
                     Choose 12 Months
@@ -648,10 +898,10 @@ const AnalysisResult = ({ data, onSelectPlan }: { data: any, onSelectPlan: (plan
                   <div className="flex justify-between items-center mb-4">
                     <span className="font-bold">BNPL (Pay in 4)</span>
                   </div>
-                  <p className="text-3xl font-display font-bold mb-2">$2,332.50 <span className="text-lg font-normal text-white/60">/bi-weekly</span></p>
+                  <p className="text-3xl font-display font-bold mb-2">${(data.total / 4).toFixed(2)} <span className="text-lg font-normal text-white/60">/bi-weekly</span></p>
                   <p className="text-sm text-white/70 mb-6">4 interest-free payments every two weeks.</p>
                   <button 
-                    onClick={() => onSelectPlan({ name: 'BNPL (Pay in 4)', amount: 2332.50 })}
+                    onClick={() => onSelectPlan({ name: 'BNPL (Pay in 4)', amount: (data.total / 4).toFixed(2) })}
                     className="w-full py-4 rounded-xl border border-white/30 text-white font-bold hover:bg-white/10 transition-colors"
                   >
                     Choose Pay in 4
